@@ -197,10 +197,90 @@ export function mulPrice(n: bigint, price: bigint | BigNumber, fromScale: bigint
   return (n * toBigInt(price)) / toBigInt(fromScale);
 }
 
-export { divPrice, presentValue, principalValue, BASE_INDEX_SCALE } from './helpers/math';
+export const BASE_INDEX_SCALE = 1e15;
 
-export function mulFactor(n: BigNumber, factor: BigNumber): BigNumber {
-  return n.mul(factor).div(factorScale);
+export function mulFactor(n: bigint | BigNumber, factor: bigint | BigNumber): bigint {
+  return toBigInt(n) * toBigInt(factor) / factorScale;
+}
+
+export function divPrice(n: bigint, price: bigint | BigNumber, toScale: bigint | BigNumber): bigint {
+  return n * toBigInt(toScale) / toBigInt(price);
+}
+
+export function presentValueSupply(baseSupplyIndex: bigint | BigNumber, principalValue: bigint | BigNumber): bigint {
+  const pv = toBigInt(principalValue);
+  const index = toBigInt(baseSupplyIndex);
+  return pv * index / BigInt(BASE_INDEX_SCALE);
+}
+
+function presentValueBorrow(baseBorrowIndex: bigint | BigNumber, principal: bigint): bigint {
+  const index = toBigInt(baseBorrowIndex);
+  return principal * index / BigInt(BASE_INDEX_SCALE);
+}
+
+export function presentValue(principalValue: bigint | BigNumber, baseSupplyIndex: bigint | BigNumber, baseBorrowIndex: bigint | BigNumber): bigint;
+export function presentValue(principalValue: bigint, comet: CometExt | CometExtAssetList): Promise<bigint>;
+export function presentValue(
+  principalValue: bigint | BigNumber,
+  secondArg: bigint | BigNumber | CometExt | CometExtAssetList,
+  thirdArg?: bigint | BigNumber
+): bigint | Promise<bigint> {
+  if (thirdArg !== undefined) {
+    const principal = toBigInt(principalValue);
+    if (principal >= 0n) {
+      return presentValueSupply(secondArg as bigint | BigNumber, principal);
+    } else {
+      return -presentValueBorrow(thirdArg, -principal);
+    }
+  } else {
+    const cometInstance = secondArg as CometExt | CometExtAssetList;
+    return cometInstance.totalsBasic().then(totalsBasic => {
+      const baseSupplyIndex = totalsBasic.baseSupplyIndex.toBigInt();
+      const baseBorrowIndex = totalsBasic.baseBorrowIndex.toBigInt();
+      const pv = toBigInt(principalValue);
+      if (pv >= 0n) {
+        return presentValueSupply(baseSupplyIndex, pv);
+      } else {
+        return -presentValueBorrow(baseBorrowIndex, -pv);
+      }
+    });
+  }
+}
+
+function principalValueSupply(baseSupplyIndex: bigint, pv: bigint): bigint {
+  return (pv * BigInt(BASE_INDEX_SCALE)) / baseSupplyIndex;
+}
+
+function principalValueBorrow(baseBorrowIndex: bigint, pv: bigint): bigint {
+  return (pv * BigInt(BASE_INDEX_SCALE) + baseBorrowIndex - 1n) / baseBorrowIndex;
+}
+
+export function principalValue(presentValue: bigint | BigNumber, baseSupplyIndex: bigint | BigNumber, baseBorrowIndex: bigint | BigNumber): Promise<bigint>;
+export function principalValue(presentValue: bigint, comet: CometExt | CometExtAssetList): Promise<bigint>;
+export async function principalValue(
+  presentValue: bigint | BigNumber,
+  secondArg: bigint | BigNumber | CometExt | CometExtAssetList,
+  thirdArg?: bigint | BigNumber
+): Promise<bigint> {
+  if (thirdArg !== undefined) {
+    const pv = toBigInt(presentValue);
+    if (pv >= 0n) {
+      return principalValueSupply(toBigInt(secondArg as bigint | BigNumber), pv);
+    } else {
+      return -principalValueBorrow(toBigInt(thirdArg), -pv);
+    }
+  } else {
+    const cometInstance = secondArg as CometExt | CometExtAssetList;
+    const totalsBasic = await cometInstance.totalsBasic();
+    const baseSupplyIndex = totalsBasic.baseSupplyIndex.toBigInt();
+    const baseBorrowIndex = totalsBasic.baseBorrowIndex.toBigInt();
+    const pv = toBigInt(presentValue);
+    if (pv >= 0n) {
+      return principalValueSupply(baseSupplyIndex, pv);
+    } else {
+      return -principalValueBorrow(baseBorrowIndex, -pv);
+    }
+  }
 }
 
 export function toBigInt(f: bigint | BigNumber): bigint {

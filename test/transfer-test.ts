@@ -1,6 +1,6 @@
 import {
   CometHarnessInterfaceExtendedAssetList, FaucetToken, NonStandardFaucetFeeToken} from 'build/types';
-import { baseBalanceOf, ethers, event, expect, exp, makeProtocol, portfolio, setTotalsBasic, wait, fastForward, MAX_ASSETS, SnapshotRestorer, takeSnapshot } from './helpers';
+import { baseBalanceOf, ethers, event, expect, exp, makeProtocol, portfolio, setTotalsBasic, wait, fastForward, MAX_ASSETS, SnapshotRestorer, takeSnapshot, UserCollateral, UserBasic } from './helpers';
 import { SignerWithAddress } from '@nomicfoundation/hardhat-ethers/signers';
 
 describe('transfer functionality', function () {
@@ -20,12 +20,22 @@ describe('transfer functionality', function () {
 
   // Signers
   let pauseGuardian: SignerWithAddress;
+  let governor: SignerWithAddress;
   let alice: SignerWithAddress;
   let bob: SignerWithAddress;
+  let dave: SignerWithAddress;
 
   // Constants
   const baseTokenSupplyAmount = exp(100, 6);
-  const collateralTokenSupplyAmount = exp(5, 18);
+  const collateralTokenSupplyAmount = exp(1, 18);
+  const collateralTokenTransferAmount = collateralTokenSupplyAmount / 4n;
+
+  // Storage
+  let deactivatedCollateralIndex: number;
+  let aliceCollateralBefore: UserCollateral;
+  let aliceBasicBefore: UserBasic;
+  let daveCollateralBefore: UserCollateral;
+  let daveBasicBefore: UserBasic;
 
   before(async () => {
     const protocol = await makeProtocol({
@@ -38,11 +48,18 @@ describe('transfer functionality', function () {
     baseToken = protocol.tokens.USDC;
     collateralToken = protocol.tokens.COMP;
     pauseGuardian = protocol.pauseGuardian;
+    governor = protocol.governor;
     alice = protocol.users[0];
     bob = protocol.users[1];
+    dave = protocol.users[2];
+
+    const collateralAssetInfo = await cometWithExtendedAssetList.getAssetInfoByAddress(collateralToken.address);
+    deactivatedCollateralIndex = collateralAssetInfo.offset;
 
     await baseToken.allocateTo(bob.address, baseTokenSupplyAmount);
     await collateralToken.allocateTo(bob.address, collateralTokenSupplyAmount);
+    await baseToken.allocateTo(dave.address, baseTokenSupplyAmount);
+    await collateralToken.allocateTo(dave.address, collateralTokenSupplyAmount);
     // Allocate some additional base tokens to the comet for borrowing
     await baseToken.allocateTo(
       cometWithExtendedAssetList.address,
@@ -50,7 +67,7 @@ describe('transfer functionality', function () {
     );
 
     const collaterals = Object.fromEntries(
-      Array.from({ length: MAX_ASSETS }, (_, j) => [`ASSET${j}`, {}])
+      Array.from({ length: MAX_ASSETS }, (_, j) => [`ASSET${j}`, { initialPrice: 100, decimals: 18 }])
     );
     const protocolWithMaxAssets = await makeProtocol({
       assets: { USDC: {}, ...collaterals },
@@ -73,6 +90,22 @@ describe('transfer functionality', function () {
       .connect(bob)
       .supply(baseToken.address, baseTokenSupplyAmount);
 
+    await collateralToken
+      .connect(dave)
+      .approve(cometWithExtendedAssetList.address, collateralTokenSupplyAmount);
+    await cometWithExtendedAssetList
+      .connect(dave)
+      .supply(collateralToken.address, collateralTokenSupplyAmount);
+
+    await cometWithExtendedAssetList.connect(dave).withdraw(baseToken.address, exp(1, 6));
+
+    aliceBasicBefore = await cometWithExtendedAssetList.userBasic(alice.address);
+    aliceCollateralBefore = await cometWithExtendedAssetList.userCollateral(alice.address, collateralToken.address);
+    daveCollateralBefore = await cometWithExtendedAssetList.userCollateral(dave.address, collateralToken.address);
+    daveBasicBefore = await cometWithExtendedAssetList.userBasic(dave.address);
+
+    // Allow alice to act on behalf of bob for transferFrom calls
+    await cometWithExtendedAssetList.connect(dave).allow(alice.address, true);
     await cometWithExtendedAssetListMaxAssets.connect(bob).allow(alice.address, true);
 
     snapshot = await takeSnapshot();
@@ -433,6 +466,9 @@ describe('transfer functionality', function () {
     });
 
     it('reverts if lenders transfer is paused', async () => {
+      // Note: we make here restore to avoid error InvalidUInt64
+      await snapshot.restore();
+
       // Pause lenders transfer
       await cometWithExtendedAssetList
         .connect(pauseGuardian)
@@ -542,6 +578,192 @@ describe('transfer functionality', function () {
         expect(collateralBalanceAliceAfter).to.be.equal(collateralBalanceAlice.add(collateralTokenSupplyAmount));
       });
     }
+
+    /**
+     * @notice End-to-end transfer behavior when collateral is deactivated and reactivated
+     * @dev
+     *  This block validates how both **collateral transfers** and **base token transfers**
+     *  behave when a collateral asset is deactivated by the `pauseGuardian` and later
+     *  reactivated by the `governor`, using the same deactivation mechanism introduced
+     *  after the wUSDM / deUSD incident.
+     *
+     *  High-level flow:
+     *  - From a prepared snapshot, where `dave` holds collateral and a borrow position
+     *    against `collateralToken` (with index `deactivatedCollateralIndex`), the
+     *    `pauseGuardian` calls `deactivateCollateral(deactivatedCollateralIndex)` on
+     *    `CometWithExtendedAssetList`.
+     *      - We assert that:
+     *          - The call succeeds (no revert).
+     *          - It emits:
+     *              - `CollateralAssetTransferPauseAction(deactivatedCollateralIndex, true)`
+     *              - `CollateralDeactivated(deactivatedCollateralIndex)`
+     *          - Core state is updated:
+     *              - `isCollateralDeactivated(deactivatedCollateralIndex)` is `true`.
+     *              - `isCollateralAssetTransferPaused(deactivatedCollateralIndex)` is `true`.
+     *
+     *  - With the collateral now deactivated:
+     *      - A `transferAsset` call for that collateral is expected to revert with
+     *        `CollateralAssetTransferPaused(deactivatedCollateralIndex)`, demonstrating
+     *        that no further collateral movement is allowed while deactivated.
+     *      - Additionally, a base token `transfer` from `dave` (who is a borrower and still
+     *        holds the deactivated collateral) is expected to revert with
+     *        `TokenIsDeactivated(collateralToken)`. This threads through the check in
+     *        `isBorrowCollateralized`, which now treats deactivated collateral as
+     *        disallowed for borrow collateralization, effectively freezing further base
+     *        transfers that would rely on that collateral while the account is borrowing.
+     *
+     *  - The `governor` then calls `activateCollateral(deactivatedCollateralIndex)`:
+     *      - We assert that:
+     *          - The call succeeds.
+     *          - It emits:
+     *              - `CollateralAssetTransferPauseAction(deactivatedCollateralIndex, false)`
+     *              - `CollateralActivated(deactivatedCollateralIndex)`
+     *          - Core state is updated:
+     *              - `isCollateralDeactivated(deactivatedCollateralIndex)` is `false`.
+     *              - `isCollateralAssetTransferPaused(deactivatedCollateralIndex)` is `false`.
+     *
+     *  - After reactivation:
+     *      - A `transferAsset` of the previously deactivated collateral from `dave` to
+     *        `alice` is allowed and:
+     *          - Decreases `dave`’s `userCollateral(...).balance` by the transfer amount.
+     *          - Increases `alice`’s collateral balance by the same amount.
+     *      - A base token `transfer` from `dave` to `alice` is now permitted again, and
+     *        subsequent checks (not shown in the snippet above) verify that principals and
+     *        overall accounting behave as expected.
+     *
+     *  In summary, these tests confirm that:
+     *  - Deactivating collateral prevents both **collateral token transfers** and
+     *    **borrower base transfers** that depend on that collateral.
+     *  - Reactivating collateral restores both transfer paths.
+     *  - The system’s safety behavior around deactivated collateral is enforced at the
+     *    transfer level, consistent with the broader collateral deactivation design.
+     */
+    describe('deactivated collateral transfer flow', function () { 
+      it('allows pause guardian to deactivate a token', async function () {
+        await snapshot.restore();
+
+        await expect(cometWithExtendedAssetList.connect(pauseGuardian).deactivateCollateral(deactivatedCollateralIndex)).to.not.be.reverted;
+      });
+
+      it('asset transfer call reverts', async function () {
+        await expect(
+          cometWithExtendedAssetList
+            .connect(dave)
+            .transferAsset(
+              alice.address,
+              collateralToken.address,
+              collateralTokenSupplyAmount
+            )
+        ).to.be.revertedWithCustomError(
+          cometWithExtendedAssetList,
+          'CollateralAssetTransferPaused'
+        ).withArgs(deactivatedCollateralIndex);
+      });
+
+      it('base token transfer reverts when user has deactivated collateral and borrow position', async function () {
+        expect((await cometWithExtendedAssetList.userBasic(dave.address)).principal).to.be.lessThan(0);
+        
+        await expect(
+          cometWithExtendedAssetList
+            .connect(dave)
+            .transfer(
+              alice.address,
+              baseTokenSupplyAmount
+            )
+        ).to.be.revertedWithCustomError(
+          cometWithExtendedAssetList,
+          'TokenIsDeactivated'
+        ).withArgs(collateralToken.address);
+      });
+
+      it('allows governor to activate a token', async function () {
+        await expect(cometWithExtendedAssetList.connect(governor).activateCollateral(deactivatedCollateralIndex)).to.not.be.reverted;
+      });
+
+      it('allows to transfer activated collateral', async function () { 
+        await cometWithExtendedAssetList
+          .connect(dave)
+          .transferAsset(alice.address, collateralToken.address, collateralTokenTransferAmount);
+      });
+
+      it('updates users collateral balances', async function () {
+        const daveCollateralAfter = await cometWithExtendedAssetList.userCollateral(dave.address, collateralToken.address);
+        const aliceCollateralAfter = await cometWithExtendedAssetList.userCollateral(alice.address, collateralToken.address);
+
+        expect(daveCollateralBefore.balance.sub(daveCollateralAfter.balance)).to.eq(collateralTokenTransferAmount);
+        expect(aliceCollateralAfter.balance.sub(aliceCollateralBefore.balance)).to.eq(collateralTokenTransferAmount);
+      });
+
+      it('allows to transfer base token', async function () {
+        await cometWithExtendedAssetList
+          .connect(dave)
+          .transfer(alice.address, baseTokenSupplyAmount);
+      });
+
+      it('updates users principals', async function () {
+        const aliceBasicAfter = await cometWithExtendedAssetList.userBasic(alice.address);
+        const daveBasicAfter = await cometWithExtendedAssetList.userBasic(dave.address);
+
+        expect(aliceBasicAfter.principal.sub(aliceBasicBefore.principal)).to.be.closeTo(baseTokenSupplyAmount, 1);
+        expect(daveBasicAfter.principal.sub(daveBasicBefore.principal)).to.be.closeTo(-baseTokenSupplyAmount, 1);
+      });
+
+      for (let i = 1; i <= MAX_ASSETS; i++) {
+        const assetIndex = i - 1;
+      
+        it(`reverts on deactivated collateral transfer with index ${i}`, async () => {
+          const assetToken = tokensWithMaxAssets[`ASSET${assetIndex}`];
+          
+          // Supply the asset first
+          await assetToken.allocateTo(dave.address, collateralTokenSupplyAmount);
+          await assetToken
+            .connect(dave)
+            .approve(
+              cometWithExtendedAssetListMaxAssets.address,
+              collateralTokenSupplyAmount
+            );
+
+          await cometWithExtendedAssetListMaxAssets
+            .connect(dave)
+            .supply(assetToken.address, collateralTokenSupplyAmount);
+
+          // Pause specific collateral asset transfer at index assetIndex
+          await cometWithExtendedAssetListMaxAssets
+            .connect(pauseGuardian)
+            .deactivateCollateral(assetIndex);
+
+          await expect(
+            cometWithExtendedAssetListMaxAssets
+              .connect(dave)
+              .transferAsset(
+                alice.address,
+                assetToken.address,
+                collateralTokenSupplyAmount
+              )
+          ).to.be.revertedWithCustomError(
+            cometWithExtendedAssetListMaxAssets,
+            'CollateralAssetTransferPaused'
+          ).withArgs(assetIndex);
+        });
+
+        it(`allows to transfer re-activated collateral with index ${i}`, async () => {
+          const assetToken = tokensWithMaxAssets[`ASSET${assetIndex}`];
+
+          await cometWithExtendedAssetListMaxAssets.connect(governor).activateCollateral(assetIndex);
+
+          await expect(
+            cometWithExtendedAssetListMaxAssets
+              .connect(dave)
+              .transferAsset(alice.address, assetToken.address, collateralTokenSupplyAmount)
+          ).to.not.be.reverted;
+
+          expect((await cometWithExtendedAssetListMaxAssets.userCollateral(alice.address, assetToken.address)).balance)
+            .to.be.equal(collateralTokenSupplyAmount);
+          expect((await cometWithExtendedAssetListMaxAssets.userCollateral(dave.address, assetToken.address)).balance)
+            .to.be.equal(0n);
+        });
+      }
+    });
   });
 
   describe('transferFrom', function () {
@@ -779,5 +1001,159 @@ describe('transfer functionality', function () {
         expect(collateralBalanceAliceAfter).to.be.equal(collateralBalanceAlice.add(collateralTokenSupplyAmount));
       });
     }
+
+    describe('deactivated collateral transferFrom flow', function () {
+      it('allows pause guardian to deactivate a token', async function () {
+        await snapshot.restore();
+
+        await expect(cometWithExtendedAssetList
+          .connect(pauseGuardian)
+          .deactivateCollateral(deactivatedCollateralIndex)).to.not.be.reverted;
+      });
+
+      it('asset transferFrom call reverts', async function () {
+        await expect(
+          cometWithExtendedAssetList
+            .connect(alice)
+            .transferAssetFrom(
+              dave.address,
+              alice.address,
+              collateralToken.address,
+              collateralTokenSupplyAmount
+            )
+        )
+          .to.be.revertedWithCustomError(
+            cometWithExtendedAssetList,
+            'CollateralAssetTransferPaused'
+          )
+          .withArgs(deactivatedCollateralIndex);
+      });
+
+      it('base token transferFrom reverts when user has deactivated collateral and borrow position', async function () {
+        expect((await cometWithExtendedAssetList.userBasic(dave.address)).principal).to.be.lessThan(0);
+
+        await expect(
+          cometWithExtendedAssetList
+            .connect(alice)
+            .transferFrom(dave.address, alice.address, baseTokenSupplyAmount)
+        )
+          .to.be.revertedWithCustomError(cometWithExtendedAssetList, 'TokenIsDeactivated')
+          .withArgs(collateralToken.address);
+      });
+
+      it('allows governor to activate a token', async function () {
+        await expect(cometWithExtendedAssetList
+          .connect(governor)
+          .activateCollateral(deactivatedCollateralIndex)).to.not.be.reverted;
+      });
+
+      it('allows to transferFrom activated collateral', async function () {
+        await cometWithExtendedAssetList
+          .connect(alice)
+          .transferAssetFrom(
+            dave.address,
+            alice.address,
+            collateralToken.address,
+            collateralTokenTransferAmount
+          );
+      });
+
+      it('updates users collateral balances', async function () {
+        const daveCollateralAfter = await cometWithExtendedAssetList.userCollateral(
+          dave.address,
+          collateralToken.address
+        );
+        const aliceCollateralAfter = await cometWithExtendedAssetList.userCollateral(
+          alice.address,
+          collateralToken.address
+        );
+
+        expect(daveCollateralBefore.balance.sub(daveCollateralAfter.balance)).to.eq(
+          collateralTokenTransferAmount
+        );
+        expect(aliceCollateralAfter.balance.sub(aliceCollateralBefore.balance)).to.eq(
+          collateralTokenTransferAmount
+        );
+      });
+
+      it('allows to transferFrom base token', async function () {
+        await cometWithExtendedAssetList
+          .connect(alice)
+          .transferFrom(dave.address, alice.address, baseTokenSupplyAmount);
+      });
+
+      it('updates users principals', async function () {
+        const aliceBasicAfter = await cometWithExtendedAssetList.userBasic(alice.address);
+        const daveBasicAfter = await cometWithExtendedAssetList.userBasic(dave.address);
+
+        expect(aliceBasicAfter.principal.sub(aliceBasicBefore.principal)).to.be.closeTo(
+          baseTokenSupplyAmount,
+          1
+        );
+        expect(daveBasicAfter.principal.sub(daveBasicBefore.principal)).to.be.closeTo(
+          -baseTokenSupplyAmount,
+          1
+        );
+      });
+
+      for (let i = 1; i <= MAX_ASSETS; i++) {
+        const assetIndex = i - 1;
+
+        it(`reverts on deactivated collateral transferFrom with index ${i}`, async () => {
+          const assetToken = tokensWithMaxAssets[`ASSET${assetIndex}`];
+          
+          // Supply the asset first
+          await assetToken.allocateTo(dave.address, collateralTokenSupplyAmount);
+          await assetToken
+            .connect(dave)
+            .approve(
+              cometWithExtendedAssetListMaxAssets.address,
+              collateralTokenSupplyAmount
+            );
+
+          await cometWithExtendedAssetListMaxAssets
+            .connect(dave)
+            .supply(assetToken.address, collateralTokenSupplyAmount);
+
+          await cometWithExtendedAssetListMaxAssets.connect(dave).allow(alice.address, true);
+
+          // Pause specific collateral asset transfer at index assetIndex
+          await cometWithExtendedAssetListMaxAssets
+            .connect(pauseGuardian)
+            .deactivateCollateral(assetIndex);
+
+          await expect(
+            cometWithExtendedAssetListMaxAssets
+              .connect(alice)
+              .transferAssetFrom(
+                dave.address,
+                alice.address,
+                assetToken.address,
+                collateralTokenSupplyAmount
+              )
+          ).to.be.revertedWithCustomError(
+            cometWithExtendedAssetListMaxAssets,
+            'CollateralAssetTransferPaused'
+          ).withArgs(assetIndex);
+        });
+
+        it(`allows to transferFrom re-activated collateral with index ${i}`, async () => {
+          const assetToken = tokensWithMaxAssets[`ASSET${assetIndex}`];
+
+          await cometWithExtendedAssetListMaxAssets.connect(governor).activateCollateral(assetIndex);
+
+          await expect(
+            cometWithExtendedAssetListMaxAssets
+              .connect(alice)
+              .transferAssetFrom(dave.address, alice.address, assetToken.address, collateralTokenSupplyAmount)
+          ).to.not.be.reverted;
+
+          expect((await cometWithExtendedAssetListMaxAssets.userCollateral(dave.address, assetToken.address)).balance)
+            .to.be.equal(0n);
+          expect((await cometWithExtendedAssetListMaxAssets.userCollateral(alice.address, assetToken.address)).balance)
+            .to.be.equal(collateralTokenSupplyAmount);
+        });
+      }
+    });
   });
 });

@@ -370,4 +370,44 @@ contract CometExt is CometExtInterface {
 
         emit CollateralAssetTransferPauseAction(assetIndex, paused);
     }
+
+    /**
+     * @inheritdoc CometExtInterface
+     */
+    function deactivateCollateral(uint24 assetIndex) override external isValidAssetIndex(assetIndex) {
+        if (msg.sender != CometMainInterface(address(this)).pauseGuardian()) revert OnlyPauseGuardian();
+        if ((deactivatedCollaterals & (uint24(1) << assetIndex) != 0) == true) revert CollateralAlreadyDeactivated(assetIndex);
+
+        // Mark collateral as deactivated
+        deactivatedCollaterals |= (uint24(1) << assetIndex);
+        emit CollateralDeactivated(assetIndex);
+        
+        // Pause supply of this collateral
+        collateralsSupplyPauseFlags |= (uint24(1) << assetIndex);
+        emit CollateralAssetSupplyPauseAction(assetIndex, true);
+        
+        // Pause transfer of this collateral
+        collateralsTransferPauseFlags |= (uint24(1) << assetIndex);
+        emit CollateralAssetTransferPauseAction(assetIndex, true);
+    }
+
+    /**
+     * @inheritdoc CometExtInterface
+     */
+    function activateCollateral(uint24 assetIndex) override external isValidAssetIndex(assetIndex) {
+        if (msg.sender != CometMainInterface(address(this)).governor()) revert OnlyGovernor();
+        if ((deactivatedCollaterals & (uint24(1) << assetIndex) != 0) == false) revert CollateralAlreadyActivated(assetIndex);
+
+        // Mark collateral as activated
+        deactivatedCollaterals &= ~(uint24(1) << assetIndex);
+        emit CollateralActivated(assetIndex);
+        
+        // Unpause supply of this collateral
+        collateralsSupplyPauseFlags &= ~(uint24(1) << assetIndex);
+        emit CollateralAssetSupplyPauseAction(assetIndex, false);
+
+        // Unpause transfer of this collateral
+        collateralsTransferPauseFlags &= ~(uint24(1) << assetIndex);
+        emit CollateralAssetTransferPauseAction(assetIndex, false);
+    }
 }

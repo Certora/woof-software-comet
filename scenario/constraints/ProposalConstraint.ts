@@ -78,6 +78,7 @@ export class ProposalConstraint<T extends CometContext> implements StaticConstra
           );
         }
 
+
         try {
           // Execute the proposal
           debug(`${label} Processing pending proposal ${proposal.id}`);
